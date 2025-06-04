@@ -1,7 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-
-
     <!-- ★ 位置 & Wi-Fi & Foreground Service 権限 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
@@ -12,12 +10,15 @@
     <!-- Android 14 以降は個別タイプ宣言が必須 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
 
-
-
     <!-- 既存 permission 群の末尾に追記 -->
     <!-- Android 13+ Wi-Fi スキャン用。必ず <application> の外で宣言 -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation"/> <!-- 位置情報と同時利用ならフラグは任意 -->
+
+
+
+    <!-- 端末再起動後に Service を自動起動するため -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
 
 
 
@@ -31,6 +32,19 @@
             android:name=".WifiLocationService"
             android:exported="false"
             android:foregroundServiceType="location"/>
+
+
+
+        <!-- BOOT_COMPLETED で Service を起動 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+
 
         <activity
             android:name=".MainActivity"

@@ -1,157 +1,182 @@
 package com.example.wifi_location_service_demo
 
+/* ───────────── Android 基本 ───────────── */
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.net.wifi.ScanResult
 import android.os.*
 import androidx.core.app.NotificationCompat
-import java.time.*
+import androidx.core.content.ContextCompat
+
+/* ───────────── Google Play Services ───── */
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+
+/* ───────────── Flutter headless Engine ── */
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.dart.DartExecutor
+import io.flutter.embedding.engine.loader.FlutterLoader
+import io.flutter.plugin.common.MethodChannel
+
+/* ───────────── Java / Time ────────────── */
+import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+
+/* ───────────── Pigeon クラス ───────────── */
 import com.example.wifi_location_service_demo.Coordinate
 import com.example.wifi_location_service_demo.CoordinatePushApi
 
-
-/* import 追加 */
-import android.net.wifi.WifiManager
-import android.content.pm.PackageManager
-import android.net.wifi.ScanResult
-import com.google.android.gms.location.*
-
-
-import android.content.Context          // ★ これを追加
-
-
+/**
+ * Foreground Service:
+ *  - 端末再起動後も自動起動（BootReceiver から）
+ *  - 1 分おきに Wi-Fi スキャン + 位置取得
+ *  - 取得座標を UI へ (Pigeon) & 背景 Dart isolate へ (MethodChannel) 送信
+ */
 class WifiLocationService : Service() {
 
-    private val handler = Handler(Looper.getMainLooper())
+    /* ── 通知 & 周期 ─────────────────────── */
     private val NOTIF_ID = 1
     private val CHANNEL_ID = "wifi_location"
+    private val INTERVAL_MS = 60_000L      // 1 分
 
-
-    /* 追加フィールド */
+    /* ── Android API ─────────────────────── */
     private lateinit var wifiManager: WifiManager
     private lateinit var fused: FusedLocationProviderClient
 
+    /* ── 背景 FlutterEngine ──────────────── */
+    private lateinit var bgEngine: FlutterEngine
+    private lateinit var bgChannel: MethodChannel
+    private val BG_CHANNEL_NAME = "bg_channel"
 
-    ///
+    /* ── Pigeon: UI 側へプッシュ ─────────── */
     companion object {
         @Volatile
         var coordinateApi: CoordinatePushApi? = null
     }
 
-    ///
-    /* ---------- Service ライフサイクル ---------- */
+    /* ── 1 分ごとに実行する Runnable ─────── */
+    private val handler = Handler(Looper.getMainLooper())
+    private val scanTask = object : Runnable {
+        override fun run() {
+            sendReal()
+            handler.postDelayed(this, INTERVAL_MS)
+        }
+    }
+
+    /* ───────────── Lifecycle ───────────── */
+
     override fun onCreate() {
         super.onCreate()
 
-
-        /* ★ ここで代入 */
+        /* Android サービス初期化 */
         wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         fused = LocationServices.getFusedLocationProviderClient(this)
 
+        /* ★ 背景 FlutterEngine を headless で起動 */
+        val loader = FlutterLoader()
+        loader.startInitialization(this)
+        loader.ensureInitializationComplete(this, null)
 
+        bgEngine = FlutterEngine(this).apply {
+            dartExecutor.executeDartEntrypoint(
+                DartExecutor.DartEntrypoint(
+                    loader.findAppBundlePath(),   // → app.dill へのパス
+                    "backgroundMain"              // → lib/background_main.dart の関数名
+                )
+            )
+        }
+        bgChannel = MethodChannel(bgEngine.dartExecutor.binaryMessenger, BG_CHANNEL_NAME)
 
-
-
+        /* Foreground 通知 */
         createChannel()
-        startForeground(NOTIF_ID, buildNotif("Scanning…"))
+        startForeground(NOTIF_ID, buildNotif("Wi-Fi スキャン実行中…"))
+
+        /* 周期タスク開始 */
         handler.post(scanTask)
     }
 
-    ///
+    /** 強制終了しても OS が Service を再生成するよう START_STICKY を返す */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
     override fun onDestroy() {
         handler.removeCallbacks(scanTask)
+        bgEngine.destroy()        // headless Engine を解放
         super.onDestroy()
     }
 
-    ///
-    /* ★ 追加：明示的に START_STICKY を返す */
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // ここでは特に intent を解析しない
-        return START_STICKY
-    }
-
-    ///
-    /* バインドしない Foreground Service */
+    /** バインドしない Foreground Service */
     override fun onBind(intent: Intent?): IBinder? = null
 
-    ///
-    /* ---------- 1 分ごとに座標送信 ---------- */
-    private val scanTask = object : Runnable {
-        override fun run() {
-//            sendDummy()
-            sendReal()
+    /* ───────────── 実測値送信 ───────────── */
 
-            handler.postDelayed(this, 60_000)  // 1 分
-        }
-    }
-
-    ///
-    private fun sendDummy() {
-        val now = LocalDateTime.now()
-        val coord = Coordinate(
-            lat = 35.0 + Math.random(),
-            lng = 139.0 + Math.random(),
-            ssid = "SampleSSID",
-            epochMillis = System.currentTimeMillis(),
-            date = now.toLocalDate().toString(),
-            time = now.toLocalTime()
-                .format(DateTimeFormatter.ISO_LOCAL_TIME)
-        )
-        /* callback が必須なので空ラムダを渡す */
-        coordinateApi?.onCoordinate(coord) {}
-    }
-
-
-    /* ---------- 実測値送信 ---------- */
     private fun sendReal() {
+        // Android 13+ では NEARBY_WIFI_DEVICES 権限が必要
         if (checkSelfPermission(android.Manifest.permission.NEARBY_WIFI_DEVICES)
             != PackageManager.PERMISSION_GRANTED
-        ) return        // 権限が拒否されている場合は送信せず
+        ) return
 
-        wifiManager.startScan()                             // 非同期スキャン開始
-        val results: List<ScanResult> = wifiManager.scanResults
-        val best = results.maxByOrNull { it.level } ?: return // 電波強度最大 SSID を採用
+        wifiManager.startScan()
+        val best: ScanResult =
+            wifiManager.scanResults.maxByOrNull { it.level } ?: return
 
         fused.lastLocation.addOnSuccessListener { loc ->
             if (loc == null) return@addOnSuccessListener
+
             val now = LocalDateTime.now()
-            val coord = Coordinate(
-                lat = loc.latitude,
-                lng = loc.longitude,
-                ssid = best.SSID ?: "(unknown)",
-                epochMillis = System.currentTimeMillis(),
-                date = now.toLocalDate().toString(),
-                time = now.toLocalTime()
-                    .format(DateTimeFormatter.ISO_LOCAL_TIME)
+            val date = now.toLocalDate().toString()
+            val time = now.toLocalTime().format(DateTimeFormatter.ISO_LOCAL_TIME)
+
+            /* ---------- UI が前面にあれば Pigeon で送る ---------- */
+            coordinateApi?.onCoordinate(
+                Coordinate(
+                    lat = loc.latitude,
+                    lng = loc.longitude,
+                    ssid = best.SSID ?: "(unknown)",
+                    epochMillis = System.currentTimeMillis(),
+                    date = date,
+                    time = time
+                )
+            ) {}
+
+            /* ---------- 背景 Dart isolate に保存依頼 ---------- */
+            val map = mapOf(
+                "lat" to loc.latitude,
+                "lng" to loc.longitude,
+                "ssid" to (best.SSID ?: "(unknown)"),
+                "epoch" to System.currentTimeMillis(),
+                "date" to date,
+                "time" to time
             )
-            coordinateApi?.onCoordinate(coord) {}
+            bgChannel.invokeMethod("saveCoordinate", map)
         }
     }
 
+    /* ───────────── 通知関連 ───────────── */
 
-    ///
-    /* ---------- 通知 ---------- */
     private fun createChannel() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (nm.getNotificationChannel(CHANNEL_ID) == null) {
             nm.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
-                    "Wi-Fi Coordinate",
+                    "Wi-Fi Location Background Service",
                     NotificationManager.IMPORTANCE_LOW
                 )
             )
         }
     }
 
-    ///
     private fun buildNotif(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Wi-Fi Location")
-            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle("Wi-Fi Location Running")
+            .setContentText(text)
+            .setOngoing(true)
             .build()
 }
